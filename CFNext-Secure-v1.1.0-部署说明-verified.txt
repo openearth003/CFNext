@@ -1,0 +1,45 @@
+CFNext Secure v1.1.0 部署说明
+
+一、建议环境变量
+U=合法 UUID（必须）
+D=自定义管理/代理路径（强烈建议设置，不建议直接暴露 UUID）
+ADMIN=强密码（必须；安全版不允许关闭管理认证）
+HOST=你的域名（使用 TLS 节点时建议设置）
+PROXYIP=可选，Cloudflare 透明中继 IP:443
+S=可选，socks5://user:pass@host:port 或 http://user:pass@host:port
+TROJAN=1 可选
+TROJAN_PASSWORD=可选
+ECH=1 可选
+ALPN=h2,http/1.1 可选
+
+二、KV
+K 仍可绑定 KV 保存图形化配置。
+安全版的登录会话不依赖 KV，而是 HMAC-SHA256 无状态 Cookie。
+
+三、公开地址
+管理面板：/<D>
+订阅：/<D>/sub
+WebSocket 代理：/<D>
+XHTTP：POST /<D>
+
+四、重要变化
+1. ADMIN 为空时，管理面板直接拒绝使用，不再存在原版“无 ADMIN 即免登录”的行为。
+2. 管理 API 必须通过 HMAC 会话 Cookie + Origin 检查。
+3. 管理 API 不返回 ADMIN、Trojan 密码、出站代理凭据。
+4. 外部优选源只接受 HTTPS，并限制响应大小、候选数量和请求超时；禁止自动跟随重定向。
+5. 订阅源做内存缓存，减少被反复刷订阅时对外部源的请求压力。
+6. VLESS 只允许 TCP；Trojan 只允许 TCP；不开放匿名 SOCKS/HTTP CONNECT 服务。
+7. PROXYIP 只由管理配置控制，客户端不能通过请求参数改变目标。
+
+五、与原 CFNext 1.0.3 的差异
+这是“安全重构版”，不是逐行兼容补丁。核心 VLESS WS、Trojan WS、XHTTP、Clash、Sing-box、Surge、Loon、Quantumult X、V2Ray 文本订阅、PROXYIP、SOCKS5/HTTP CONNECT 出站均保留。
+原版非常复杂的在线测速/自动优选 UI、300 条内置 IP 池和部分高级分流模板没有在本版伪装成完全等价实现，而是先收敛为受限 HTTPS 候选源模式。这样便于先把安全边界固定下来，再逐项把高级功能加回去。
+
+六、首次部署
+1. Cloudflare Workers 新建 Worker。
+2. 粘贴 CFNext-Secure-v1.1.0.js 全部内容。
+3. 设置 U、D、ADMIN。
+4. 如果使用图形化保存，再绑定 KV，变量名 K。
+5. 先访问 /<D>，确认必须跳转 /login。
+6. 登录后打开订阅 /<D>/sub 测试。
+7. 确认 VLESS UUID 与客户端配置一致后，再启用 Trojan/XHTTP/PROXYIP。
