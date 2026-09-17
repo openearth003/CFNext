@@ -489,6 +489,49 @@ function isValidIp(str) {
   if (hasDbl && (groups.length < 1 || groups.length > 7)) return false;
   return groups.every(g => /^[0-9a-fA-F]{1,4}$/.test(g));
 }
+
+// SSRF 防护：判定主机是否为禁止访问的内网/保留/元数据地址。
+// 出站 connect 与 URL fetch 的目标若命中则拒绝，阻断面板被用作内网扫描器/SSRF 跳板。
+const SSRF_BLOCK_HOSTS = new Set([
+  'localhost', 'localhost.localdomain', 'metadata.google.internal',
+  'metadata', 'instance-data', '169.254.169.254', '100.100.100.200'
+]);
+function isBlockedHost(host) {
+  host = String(host || '').toLowerCase().trim().replace(/^\[|\]$/g, '');
+  if (!host) return true;
+  if (SSRF_BLOCK_HOSTS.has(host)) return true;
+  if (host.endsWith('.local') || host.endsWith('.internal') || host.endsWith('.localhost')) return true;
+  // IPv4 内网/保留/链路本地/元数据段
+  const m4 = host.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (m4) {
+    const [a, b, c] = m4.slice(1).map(Number);
+    const n = (a << 24) | (b << 16) | (c << 8) | 0;
+    if (a === 0 || a === 10 || a === 127) return true;                       // 0.0.0.0/8, 10/8, 127/8
+    if (a === 169 && b === 254) return true;                                  // 链路本地 169.254/16（含元数据 169.254.169.254）
+    if (a === 100 && b >= 64 && b <= 127) return true;                        // 运营商级 NAT 100.64/10
+    if (a === 172 && b >= 16 && b <= 31) return true;                         // 172.16/12
+    if (a === 192 && b === 168) return true;                                  // 192.168/16
+    if (a === 192 && b === 0 && c === 0) return true;                         // 192.0.0/24
+    if (a === 192 && b === 0 && c === 2) return true;                         // 192.0.2/24（文档）
+    if (a >= 224) return true;                                                // 组播/保留
+    if (a === 198 && (b === 18 || b === 19)) return true;                     // 198.18/15 基准测试
+  }
+  // IPv6 回环/链路本地/唯一本地/元数据
+  if (host.includes(':')) {
+    if (host === '::1' || host.startsWith('fe80:') || host.startsWith('fc') || host.startsWith('fd')) return true;
+    if (host.startsWith('::ffff:127.') || host.startsWith('::ffff:10.') || host.startsWith('::ffff:169.254.')) return true;
+  }
+  return false;
+}
+
+// 校验 URL 是否可安全 fetch（SSRF 防护）：协议仅 http/https，host 非内网
+function isSafeUrl(rawUrl) {
+  try {
+    const u = new URL(String(rawUrl || ''));
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') return false;
+    return !isBlockedHost(u.hostname);
+  } catch (e) { return false; }
+}
 function formatIPv6(bytes) {
   const parts = [];
   for (let i = 0; i < 16; i += 2) parts.push(((bytes[i] << 8) | bytes[i + 1]).toString(16));
@@ -620,6 +663,8 @@ async function loadConfig(env) {
   if (!isUUID(cfg.uuid)) cfg.uuid = uuidv4();
   if (!cfg.path) cfg.path = cfg.uuid;
   if (!Array.isArray(cfg.preferredIPs)) cfg.preferredIPs = parseIPList(cfg.preferredIPs);
+  // 挂载 env 引用供认证/校验使用（不序列化进 KV，saveConfig 会深拷贝剥离）
+  Object.defineProperty(cfg, '__env', { value: env, enumerable: false, writable: true });
   return cfg;
 }
 
@@ -629,6 +674,20 @@ async function saveConfig(env, cfg) {
   if (clone.admin) clone.admin = String(clone.admin);
   await env.K.put('config', JSON.stringify(clone));
   return true;
+}
+
+// 对外返回配置前脱敏：admin 明文、Trojan 密码、出站代理凭据绝不回传前端。
+// 仅保留「是否已设置」标志，前端据此渲染提示，不影响任何功能。
+function redactConfig(cfg) {
+  const out = JSON.parse(JSON.stringify(cfg));   // 剥离 __env 等不可枚举/函数字段
+  out.admin = cfg.admin ? '***' : '';            // 不泄露明文，仅标记已设置
+  out.hasAdmin = !!cfg.admin;
+  out.trojanPassword = cfg.trojanPassword ? '***' : '';
+  if (out.outboundProxy) {
+    // 隐藏 user:pass@ 凭据段，仅保留协议与主机（如 socks5://***@1.2.3.4:1080）
+    out.outboundProxy = String(out.outboundProxy).replace(/\/\/([^@\/]+)@/, '//***@');
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -765,6 +824,8 @@ function trojanPasswordHash(pass) {
 // 出站连接：直连 / SOCKS5 / HTTP CONNECT / 反代 IP 中继
 // ---------------------------------------------------------------------------
 async function connectDirect(target, timeoutMs) {
+  // SSRF 防护：拒绝内网/元数据/保留地址直连，阻断把 Worker 当内网扫描器
+  if (isBlockedHost(target.hostname)) throw new Error('目标地址被拒绝（内网/保留地址）: ' + target.hostname);
   const socket = connect({ hostname: target.hostname, port: target.port });
   // 连接超时保护：目标 SYN 被静默丢弃（CF 回环保护 / 不可达）时不再无限挂起，及时进入反代兜底
   let timer = null;
@@ -787,6 +848,7 @@ async function connectDirect(target, timeoutMs) {
 
 // 通过 SOCKS5 代理建立到目标的连接
 async function connectViaSocks5(proxy, target) {
+  if (isBlockedHost(proxy.host)) throw new Error('出站代理地址被拒绝: ' + proxy.host);
   const socket = connect({hostname: proxy.host, port: proxy.port});
   await socket.opened;
   const writer = socket.writable.getWriter();
@@ -841,6 +903,7 @@ async function connectViaSocks5(proxy, target) {
 
 // 通过 HTTP/HTTPS CONNECT 代理建立连接
 async function connectViaHttpProxy(proxy, target) {
+  if (isBlockedHost(proxy.host)) throw new Error('出站代理地址被拒绝: ' + proxy.host);
   const socket = connect({ hostname: proxy.host, port: proxy.port });
   await socket.opened;
   const writer = socket.writable.getWriter();
@@ -1247,12 +1310,15 @@ async function collectCandidates(opt) {
     } else stats.presetErr = res ? ('HTTP ' + res.status) : '超时/网络错误';
   }
   if (opt.sourceURL) {
-    const res = await fetchTimeout(opt.sourceURL, { headers: { 'User-Agent': 'Mozilla/5.0' } }, 6000);
-    if (res && res.ok) {
-      const arr = extractCandidates(await res.text());
-      arr.forEach(push);
-      stats.custom = arr.length;
-    } else stats.customErr = res ? ('HTTP ' + res.status) : '超时/网络错误';
+    if (!isSafeUrl(opt.sourceURL)) { stats.customErr = '自定义源地址被拒绝（非 http/https 或内网地址）'; }
+    else {
+      const res = await fetchTimeout(opt.sourceURL, { headers: { 'User-Agent': 'Mozilla/5.0' } }, 6000);
+      if (res && res.ok) {
+        const arr = extractCandidates(await res.text());
+        arr.forEach(push);
+        stats.custom = arr.length;
+      } else stats.customErr = res ? ('HTTP ' + res.status) : '超时/网络错误';
+    }
   }
   // 按 IP 去重（忽略端口）：同一 IP 无论来源/端口如何只保留一条，避免候选框出现重复 IP
   const seen = new Set();
@@ -1408,6 +1474,7 @@ async function resolvePreferredDomains(domainsStr, limitPerDomain = 100, maxTota
       const cHit = DNH_CACHE.get(ck);
       if (cHit && now - cHit.t < 10 * 60 * 1000) return cHit.ips.slice(0, limitPerDomain);
       try {
+        if (!isSafeUrl(d)) throw new Error('目标地址被拒绝（SSRF）');
         const res = await fetchTimeout(d, {}, 6000);
         if (!res || !res.ok) throw new Error('unreachable');
         const txt = await res.text();
@@ -3004,11 +3071,40 @@ function isBrowserUA(ua) {
   return (ua || '').toLowerCase().includes('mozilla');
 }
 
+// 服务端会话 token：登录时随机生成并持久化到 KV（键 luma_token），校验时比对 token。
+// 不再用 md5(admin) 作凭证——admin 明文一旦泄露即可离线伪造 Cookie 接管面板。
+function parseCookie(request, name) {
+  const cookies = request.headers.get('Cookie') || '';
+  const m = cookies.match(new RegExp('(?:^|;\\s*)' + name + '=([^;]+)'));
+  return m ? decodeURIComponent(m[1]) : '';
+}
+
+async function readAuthToken(env) {
+  if (!env.K || typeof env.K.get !== 'function') return '';
+  try { return (await env.K.get('luma_token')) || ''; } catch (e) { return ''; }
+}
+
+async function writeAuthToken(env, token) {
+  if (!env.K || typeof env.K.put !== 'function') return;
+  try { await env.K.put('luma_token', token); } catch (e) { /* KV 不可用则回退内存 */ }
+}
+
+// 内存兜底：未绑定 KV 时 token 存于模块级变量（单实例生命周期内有效）
+let _memAuthToken = '';
+
 async function requireAuth(request, cfg) {
   if (!cfg.admin) return true;
-  const cookies = request.headers.get('Cookie') || '';
-  const m = cookies.match(/(?:^|;\s*)luma_auth=([^;]+)/);
-  return !!(m && m[1] === md5hex(String(cfg.admin)));
+  const cookieToken = parseCookie(request, 'luma_auth');
+  if (!cookieToken) return false;
+  const stored = await readAuthToken(cfg.__env);
+  const expected = stored || _memAuthToken;
+  if (!expected) return false;
+  // 常量时间比较，降低时序侧信道
+  let diff = 0;
+  const a = cookieToken, b = expected;
+  const len = Math.max(a.length, b.length);
+  for (let i = 0; i < len; i++) diff |= (a.charCodeAt(i) || 0) ^ (b.charCodeAt(i) || 0);
+  return diff === 0 && a.length === b.length;
 }
 
 async function handleRequest(request, env) {
@@ -3037,12 +3133,15 @@ async function handleRequest(request, env) {
       const body = await request.text();
       const params = new URLSearchParams(body);
       if (params.get('password') === cfg.admin) {
-        const token = md5hex(String(cfg.admin));
+        // 服务端随机 token：不可由 admin 明文反推，杜绝离线伪造 Cookie
+        const token = uuidv4() + uuidv4();
+        await writeAuthToken(env, token);
+        _memAuthToken = token;
         return new Response(JSON.stringify({ ok: true, next: params.get('next') || '/' }), {
           status: 200,
           headers: {
             'Content-Type': 'application/json; charset=utf-8',
-            'Set-Cookie': `luma_auth=${token}; Path=/; Max-Age=86400; HttpOnly; Secure; SameSite=Lax`
+            'Set-Cookie': `luma_auth=${encodeURIComponent(token)}; Path=/; Max-Age=86400; HttpOnly; Secure; SameSite=Lax`
           }
         });
       }
@@ -3120,7 +3219,7 @@ async function handleRequest(request, env) {
 
     if (apiName === 'config') {
       if (request.method === 'GET') {
-        return json({ ok: true, data: Object.assign({}, cfg, { version: VERSION }) });
+        return json({ ok: true, data: Object.assign(redactConfig(cfg), { version: VERSION }) });
       }
       if (request.method === 'POST') {
         try {
@@ -3128,9 +3227,14 @@ async function handleRequest(request, env) {
           const merged = Object.assign(JSON.parse(JSON.stringify(cfg)), body);
           if (body.optimizer && typeof body.optimizer === 'object') merged.optimizer = Object.assign(merged.optimizer, body.optimizer);
           if (body.preferredIPs && Array.isArray(body.preferredIPs)) merged.preferredIPs = body.preferredIPs;
+          // 前端回传的是脱敏值（'***'/hasAdmin 标志），不能覆盖真实凭据
+          delete merged.hasAdmin;
+          if (merged.admin === '***') merged.admin = cfg.admin;
+          if (merged.trojanPassword === '***') merged.trojanPassword = cfg.trojanPassword;
+          if (merged.outboundProxy && /\/\/\*{3}@/.test(merged.outboundProxy)) merged.outboundProxy = cfg.outboundProxy;
           await saveConfig(env, merged);
           const fresh = await loadConfig(env, request.url);
-          return json({ ok: true, data: Object.assign({}, fresh, { version: VERSION }), msg: '已保存并生效' });
+          return json({ ok: true, data: Object.assign(redactConfig(fresh), { version: VERSION }), msg: '已保存并生效' });
         } catch (e) { return json({ ok: false, msg: '保存失败: ' + (e.message || e) }, 500); }
       }
     }
@@ -3141,6 +3245,8 @@ async function handleRequest(request, env) {
         if (!env.K || typeof env.K.delete !== 'function') return json({ ok: false, msg: '未绑定 KV 命名空间，无需重置' }, 400);
         await env.K.delete('config');
         await env.K.delete('issued');
+        try { await env.K.delete('luma_token'); } catch (e) { /* 忽略 */ }
+        _memAuthToken = '';
         return json({ ok: true, msg: '已重置：KV 已清空，面板还原为初始部署状态' });
       } catch (e) { return json({ ok: false, msg: '重置失败: ' + (e.message || e) }, 500); }
     }
